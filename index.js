@@ -46,8 +46,14 @@ export const Config = Schema.object({
     .description('Only show browser notifications while the window is hidden or unfocused; a window you are looking at already has your attention.')
     .volatile(),
   webhookUrl: Schema.string().default('')
-    .description('Optional URL to POST a JSON payload to (Slack-compatible "text" field included).')
+    .description('Optional URL to POST notifications to, using webhookFormat.')
     .role('secret')
+    .volatile(),
+  webhookFormat: Schema.union(['generic', 'wps-markdown']).default('generic')
+    .description('Webhook payload: generic JSON (Slack-compatible) or WPS group robot Markdown.')
+    .volatile(),
+  webhookLanguage: Schema.union(['en', 'zh-CN']).default('en')
+    .description('Language for webhook event labels and duration text; does not change desktop/browser notifications.')
     .volatile(),
   title: Schema.string().default('DeepSeek Harness')
     .description('Title used for desktop and browser notifications.')
@@ -242,6 +248,44 @@ function formatDuration(ms) {
   return `${Math.floor(s / 60)}m ${s % 60}s`
 }
 
+export function buildWebhookPayload({ summary, body, level, ts = new Date().toISOString() }, format = 'generic', language = 'en') {
+  if (format !== 'wps-markdown') {
+    return { text: body ? `${summary} — ${body}` : summary, summary, body, level, ts }
+  }
+  const zh = language === 'zh-CN'
+  const icon = level === 'error' ? '❌' : level === 'warn' ? '🔔' : '✅'
+  const escape = (text) => String(text).replace(/[\\`*_\[\]<>]/g, '\\$&')
+  const time = zh
+    ? `${new Date(ts).toLocaleString('zh-CN', { timeZone: 'Asia/Shanghai', hour12: false })}（北京时间）`
+    : ts
+  return {
+    msgtype: 'markdown',
+    markdown: { text: `### ${icon} DSH · ${escape(summary)}\n\n${escape(body)}\n\n**${zh ? '时间' : 'Time'}：** ${time}` },
+  }
+}
+
+export async function sendWebhook(url, payload, format = 'generic') {
+  let response
+  try {
+    response = await fetch(url, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify(payload),
+      redirect: 'error',
+      signal: AbortSignal.timeout(10_000),
+    })
+  } catch {
+    throw new Error('Network failure or timeout; delivery unknown, not retried')
+  }
+  if (!response.ok) throw new Error(`HTTP ${response.status}`)
+  if (format !== 'wps-markdown') return
+  let result
+  try { result = await response.json() } catch { throw new Error('Invalid WPS response') }
+  const codes = [result?.code, result?.errcode, result?.error_code].filter((code) => code !== undefined)
+  if (result?.success === false || codes.some((code) => String(code) !== '0')) throw new Error('WPS rejected the message')
+  if (!codes.length && result?.success !== true && result?.result !== 'ok') throw new Error('Unrecognized WPS response')
+}
+
 export function apply(ctx, config) {
   // Live turn state per agent: when the current turn started and whether its
   // failure was already announced. A WeakMap keeps disposed agents collectable
@@ -260,7 +304,7 @@ export function apply(ctx, config) {
     subagents.delete(session.id)
   })
 
-  function notify(summary, body, level) {
+  function notify(summary, body, level, chinese) {
     const text = body ? `${summary} — ${body}` : summary
     if (config.desktop.get()) {
       desktopNotify(config.title.get(), text, {
@@ -270,15 +314,13 @@ export function apply(ctx, config) {
     }
     const webhookUrl = config.webhookUrl.get()
     if (webhookUrl) {
-      fetch(webhookUrl, {
-        method: 'POST',
-        headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({ text, summary, body, level, ts: new Date().toISOString() }),
-        signal: AbortSignal.timeout(10_000),
-      }).catch((error) => {
-        // Never let a webhook failure surface into the agent loop — but a
-        // silently dead webhook is undiagnosable, so log it once per failure.
-        ctx.logger(name).warn('webhook POST failed: %s', error?.message ?? error)
+      const format = config.webhookFormat.get()
+      const language = config.webhookLanguage.get()
+      const content = language === 'zh-CN' ? chinese : { summary, body }
+      const payload = buildWebhookPayload({ ...content, level }, format, language)
+      sendWebhook(webhookUrl, payload, format).catch((error) => {
+        // Only sanitized diagnostics reach logs, never the URL or response body.
+        ctx.logger(name).warn('webhook POST failed: %s', error.message)
       })
     }
   }
@@ -298,7 +340,11 @@ export function apply(ctx, config) {
     if (turn.errored) return
     const elapsed = Date.now() - turn.startedAt
     if (elapsed < config.minTurnDurationMs.get()) return
-    notify('Agent finished', `done in ${formatDuration(elapsed)}`, 'info')
+    const seconds = Math.round(elapsed / 1000)
+    const duration = seconds < 60 ? `${seconds} 秒` : `${Math.floor(seconds / 60)} 分 ${seconds % 60} 秒`
+    notify('Agent finished', `done in ${formatDuration(elapsed)}`, 'info', {
+      summary: '任务完成', body: `耗时：${duration}`,
+    })
   })
 
   // A step or turn errored (emit mode).
@@ -311,7 +357,9 @@ export function apply(ctx, config) {
     if (!config.notifyOnError.get()) return
     if (subagents.has(agent.id)) return
     const detail = String(error?.message ?? error ?? 'unknown error').slice(0, 200)
-    notify('Agent error', `turn ${turn}, step ${step}: ${detail}`, 'error')
+    notify('Agent error', `turn ${turn}, step ${step}: ${detail}`, 'error', {
+      summary: '执行异常', body: `第 ${turn} 轮，第 ${step} 步：${error == null ? '未知错误' : detail}`,
+    })
   })
 
   // A tool call awaits approval. approval/request is a WATERFALL: this
@@ -324,7 +372,10 @@ export function apply(ctx, config) {
       // reason is the logged one.
       const reason = req.displayReason?.en ?? req.reason
       const detail = reason ? `${req.toolName} — ${reason}` : req.toolName
-      notify('Approval needed', detail, 'warn')
+      const chineseReason = req.displayReason?.['zh-CN'] ?? req.displayReason?.zh ?? req.reason ?? reason
+      notify('Approval needed', detail, 'warn', {
+        summary: '等待审批', body: chineseReason ? `${req.toolName} — ${chineseReason}` : req.toolName,
+      })
     }
     return next()
   })

@@ -49,6 +49,8 @@ test('documented defaults are the schema defaults', () => {
     browser: true,
     browserOnlyWhenHidden: true,
     webhookUrl: '',
+    webhookFormat: 'generic',
+    webhookLanguage: 'en',
     title: 'DeepSeek Harness',
     sound: 'Glass',
     windowsAppId: '',
@@ -157,11 +159,7 @@ test('desktopNotify plays a configured file through afplay on macOS', () => {
     emitter.unref = () => {}
     return emitter
   }
-  desktopNotify('t', 'b', { sound: file, spawn: (command, args) => { commands.push({ command, args }); return make() } })
-  if (process.platform !== 'darwin') {
-    assert.deepEqual(commands.map((call) => call.command), ['notify-send'])
-    return
-  }
+  desktopNotify('t', 'b', { platform: 'darwin', sound: file, spawn: (command, args) => { commands.push({ command, args }); return make() } })
   assert.deepEqual(commands.map((call) => call.command), ['afplay', 'osascript'])
 })
 
@@ -249,20 +247,22 @@ function createHostHarness(overrides = {}) {
     browser: true,
     browserOnlyWhenHidden: true,
     webhookUrl: 'https://hook.test/dsh',
+    webhookFormat: 'generic',
+    webhookLanguage: 'en',
     title: 'DeepSeek Harness',
     sound: '',
     ...overrides,
   }
   // Volatile config fields are live references on the host half.
-  const config = Object.fromEntries(Object.entries(values).map(([key, value]) => [key, { get: () => value }]))
+  const config = Object.fromEntries(Object.keys(values).map((key) => [key, { get: () => values[key] }]))
 
   const listeners = new Map()
   const posts = []
   const warnings = []
   const originalFetch = globalThis.fetch
   globalThis.fetch = (url, init) => {
-    posts.push({ url, payload: JSON.parse(init.body) })
-    return Promise.resolve({ ok: true })
+    posts.push({ url, payload: JSON.parse(init.body), init })
+    return Promise.resolve({ ok: true, status: 200, json: async () => ({ code: 0 }) })
   }
 
   const agents = new Map()
@@ -306,6 +306,93 @@ test('a finished turn posts once, with its duration', async () => {
   } finally {
     harness.restore()
   }
+})
+
+test('WPS completion uses Markdown and Chinese text without changing the badge channel', () => {
+  const harness = createHostHarness({ webhookFormat: 'wps-markdown', webhookLanguage: 'zh-CN' })
+  try {
+    harness.emit('agent/status', { agent: harness.agent('s1'), status: 'running' })
+    harness.emit('agent/status', { agent: harness.agent('s1'), status: 'idle' })
+    const { payload, init } = harness.posts[0]
+    assert.equal(payload.msgtype, 'markdown')
+    assert.match(payload.markdown.text, /任务完成/)
+    assert.match(payload.markdown.text, /耗时：0 秒/)
+    assert.match(payload.markdown.text, /北京时间/)
+    assert.doesNotMatch(payload.markdown.text, /Agent finished|done in/)
+    assert.equal(init.redirect, 'error')
+  } finally { harness.restore() }
+})
+
+test('Chinese webhook errors remain errors and approvals prefer the Chinese reason', () => {
+  const harness = createHostHarness({ webhookFormat: 'wps-markdown', webhookLanguage: 'zh-CN' })
+  try {
+    harness.emit('agent/status', { agent: harness.agent('s1'), status: 'running' })
+    harness.emit('agent/error', { agent: harness.agent('s1'), turn: 2, step: 3, error: new Error('连接失败') })
+    harness.emit('agent/status', { agent: harness.agent('s1'), status: 'idle' })
+    assert.equal(harness.posts.length, 1)
+    assert.match(harness.posts[0].payload.markdown.text, /执行异常/)
+    assert.match(harness.posts[0].payload.markdown.text, /第 2 轮，第 3 步：连接失败/)
+    const outcome = harness.emit('approval/request', {
+      toolName: 'pwsh', reason: 'fallback', displayReason: { en: 'Run command', 'zh-CN': '执行命令' },
+    }, () => 'allowed-once')
+    assert.equal(outcome, 'allowed-once')
+    assert.match(harness.posts[1].payload.markdown.text, /等待审批/)
+    assert.match(harness.posts[1].payload.markdown.text, /执行命令/)
+    assert.doesNotMatch(harness.posts[1].payload.markdown.text, /Run command/)
+  } finally { harness.restore() }
+})
+
+test('webhook format and language can change live, and generic fields stay compatible', () => {
+  const harness = createHostHarness()
+  try {
+    const complete = () => {
+      harness.emit('agent/status', { agent: harness.agent('s1'), status: 'running' })
+      harness.emit('agent/status', { agent: harness.agent('s1'), status: 'idle' })
+    }
+    complete()
+    assert.deepEqual(Object.keys(harness.posts[0].payload).sort(), ['body', 'level', 'summary', 'text', 'ts'])
+    assert.equal(harness.posts[0].payload.summary, 'Agent finished')
+    harness.values.webhookLanguage = 'zh-CN'
+    complete()
+    assert.equal(harness.posts[1].payload.summary, '任务完成')
+    harness.values.webhookFormat = 'wps-markdown'
+    harness.values.webhookLanguage = 'en'
+    complete()
+    assert.equal(harness.posts[2].payload.msgtype, 'markdown')
+    assert.match(harness.posts[2].payload.markdown.text, /Agent finished/)
+  } finally { harness.restore() }
+})
+
+test('HTTP and WPS business failures are logged once without leaking response text or keys', async () => {
+  for (const response of [
+    { ok: false, status: 429 },
+    { ok: true, json: async () => ({ code: 400, msg: 'secret-key' }) },
+    { ok: true, json: async () => ({ error_code: 'InvalidArgument', message: 'secret-key' }) },
+    { ok: true, json: async () => { throw new Error('secret-key') } },
+    { ok: true, json: async () => ({ unexpected: 'secret-key' }) },
+  ]) {
+    const harness = createHostHarness({ webhookFormat: 'wps-markdown' })
+    try {
+      let calls = 0
+      globalThis.fetch = async () => { calls++; return response }
+      harness.emit('agent/status', { agent: harness.agent('s1'), status: 'running' })
+      harness.emit('agent/status', { agent: harness.agent('s1'), status: 'idle' })
+      await new Promise((resolve) => setImmediate(resolve))
+      assert.equal(calls, 1)
+      assert.equal(harness.warnings.length, 1)
+      assert.doesNotMatch(JSON.stringify(harness.warnings), /secret-key/)
+    } finally { harness.restore() }
+  }
+})
+
+test('WPS success is not logged as failure', async () => {
+  const harness = createHostHarness({ webhookFormat: 'wps-markdown' })
+  try {
+    harness.emit('agent/status', { agent: harness.agent('s1'), status: 'running' })
+    harness.emit('agent/status', { agent: harness.agent('s1'), status: 'idle' })
+    await new Promise((resolve) => setImmediate(resolve))
+    assert.equal(harness.warnings.length, 0)
+  } finally { harness.restore() }
 })
 
 test('a short turn stays quiet', () => {

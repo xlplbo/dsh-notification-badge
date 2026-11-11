@@ -1,5 +1,13 @@
 # dsh-notification-badge
 
+This fork adds native WPS Markdown webhooks and Chinese webhook messages. Install it with:
+
+```powershell
+dsh plugin --profile desktop add github:xlplbo/dsh-notification-badge
+```
+
+The default generic JSON/English behavior and the app-icon badge are preserved.
+
 > Desktop, browser + webhook notifications **and an attention badge on the app icon** for
 > [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness) on **macOS · Linux · Windows**:
 > know when your agent **finishes a turn**, **hits an error**, or is **waiting for your approval** —
@@ -25,10 +33,10 @@ Each event can go to:
 - **Desktop notification** — zero dependencies: `osascript` (macOS), `notify-send` (Linux),
   PowerShell toast (Windows), optionally with a sound on macOS.
 - **Browser notification** — the standard `Notification` API in the Web UI.
-- **Webhook** — a JSON `POST` with a Slack-compatible `text` field, so a Slack incoming webhook
-  works as-is. Other services need their own field: Discord, for example, ignores `text` and wants
-  the same string as `content`, so point the webhook at a small relay (or a Slack-compatible
-  bridge) when you need Discord messages.
+- **Webhook** — a JSON `POST` with a Slack-compatible `text` field by default, or a native WPS
+  group-robot Markdown payload with `webhookFormat: wps-markdown`. Use `webhookLanguage: zh-CN`
+  for Chinese event labels and durations. Other services such as Discord still need a relay
+  when their expected payload differs.
 - **App-icon badge** — the count of sessions that need you, on the macOS Dock tile, the Windows
   taskbar button, or the Linux launcher entry.
 
@@ -126,7 +134,9 @@ Override the row in your profile's `cordis.patch.yml`:
 | `desktop` | boolean | `true` | Native desktop notification on the server host |
 | `browser` | boolean | `true` | Browser `Notification` popups in the Web UI |
 | `browserOnlyWhenHidden` | boolean | `true` | Suppress popups while you are looking at the window |
-| `webhookUrl` | string | `''` | Optional POST target (Slack-compatible payload) |
+| `webhookUrl` | string | `''` | Optional POST target; empty disables webhooks |
+| `webhookFormat` | `generic` \| `wps-markdown` | `generic` | Generic JSON or native WPS robot Markdown |
+| `webhookLanguage` | `en` \| `zh-CN` | `en` | Webhook labels and durations only; raw error/reason text is not machine-translated |
 | `title` | string | `'DeepSeek Harness'` | Title for desktop and browser notifications |
 | `sound` | string | `'Glass'` | macOS: a system sound name such as `Glass` (resolved to an audio file in `~/Library/Sounds`, `/Library/Sounds` or `/System/Library/Sounds`) or an audio file path (absolute, or relative to `~/Library/Sounds`); the resolved file plays through `afplay`; `''` is silent |
 | `windowsAppId` | string | `''` | Windows: AppUserModelID the toast is attributed to; empty uses the posting process's registered identity |
@@ -158,6 +168,8 @@ setting.
 
 ### Webhook payload
 
+The default `generic` / `en` settings preserve this payload:
+
 ```json
 {
   "text": "Agent finished — done in 2m 14s",
@@ -167,6 +179,39 @@ setting.
   "ts": "2026-08-21T12:34:56.000Z"
 }
 ```
+
+### WPS group robot / 中文推送
+
+```yaml
+- id: notify-badge
+  config:
+    webhookUrl: 'https://xz.wps.cn/api/v1/webhook/send?key=YOUR_KEY'
+    webhookFormat: wps-markdown
+    webhookLanguage: zh-CN
+```
+
+Example rendering (the elapsed time and timestamp are illustrative):
+
+> ### ✅ DSH · 任务完成
+>
+> 耗时：2 分 14 秒
+>
+> **时间：** 2026/11/11 11:30:00（北京时间）
+
+Error and approval headings become `执行异常` and `等待审批`. Approval reasons prefer the
+Chinese presentation text when supplied; otherwise the original reason is retained. Desktop
+and browser notification wording is unchanged. Webhooks fire regardless of window focus.
+They announce a completed **turn**, not necessarily the completion of a multi-turn goal.
+
+WPS receives `{"msgtype":"markdown","markdown":{"text":"…"}}`. Chinese timestamps use
+Asia/Shanghai; English timestamps use UTC ISO format. Markdown metacharacters in event text
+are escaped. HTTP failures and WPS business-level rejections are logged without the webhook
+URL or response body. Unknown/invalid responses are failures, not proof of delivery.
+
+There is no automatic retry (a timeout may already have delivered a message), no signing-key
+support, and no outbound queue. WPS rate limits still apply (20 messages/minute); rejected
+messages are logged, not replayed. Keep the real webhook key in the local DSH settings, never
+in this repository. Existing error-detail and approval-reason forwarding remains enabled.
 
 ## The app-icon badge
 
