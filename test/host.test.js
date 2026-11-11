@@ -319,7 +319,7 @@ test('WPS completion uses Markdown and Chinese text without changing the badge c
     const { payload, init } = harness.posts[0]
     assert.equal(payload.msgtype, 'markdown')
     assert.match(payload.markdown.text, /任务完成/)
-    assert.match(payload.markdown.text, /耗时：0 秒/)
+    assert.match(payload.markdown.text, /\*\*耗时：0 秒\*\*/)
     assert.match(payload.markdown.text, /北京时间/)
     assert.doesNotMatch(payload.markdown.text, /Agent finished|done in/)
     assert.equal(init.redirect, 'error')
