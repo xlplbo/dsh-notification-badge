@@ -198,7 +198,7 @@ Example rendering (the elapsed time and timestamp are illustrative):
 >
 > **最后提问：** 这个提醒没有会话名字，如果能加上最后一次提问更好。
 >
-> **耗时：2 分 14 秒**
+> **耗时：** 2 分 14 秒
 >
 > **时间：** 2026/11/11 11:30:00（北京时间）
 

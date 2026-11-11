@@ -268,7 +268,7 @@ export function buildWebhookPayload({ summary, body, level, sessionTitle, latest
     markdown: { text: [
       `### ${icon} DSH · ${escape(summary)}`,
       ...context.map(([label, value]) => `**${label}：** ${escape(value)}`),
-      escape(body).replace(/^(耗时：.*|done in .*)$/gm, '**$1**'),
+      escape(body).replace(/^耗时：/gm, '**耗时：** '),
       `**${zh ? '时间' : 'Time'}：** ${time}`,
     ].join('\n\n') },
   }
