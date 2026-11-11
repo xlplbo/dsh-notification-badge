@@ -271,6 +271,7 @@ function createHostHarness(overrides = {}) {
       listeners.set(event, listener)
       return () => listeners.delete(event)
     },
+    sessionTitle: { get: (session) => session.title ? { title: session.title } : undefined },
     logger: () => ({ warn: (...args) => warnings.push(args) }),
   }
   apply(ctx, config)
@@ -392,6 +393,94 @@ test('WPS success is not logged as failure', async () => {
     harness.emit('agent/status', { agent: harness.agent('s1'), status: 'idle' })
     await new Promise((resolve) => setImmediate(resolve))
     assert.equal(harness.warnings.length, 0)
+  } finally { harness.restore() }
+})
+
+test('WPS completion identifies the session and the latest human question', () => {
+  const harness = createHostHarness({ webhookFormat: 'wps-markdown', webhookLanguage: 'zh-CN' })
+  try {
+    const agent = harness.agent('s1')
+    agent.session = {
+      id: 's1', title: '通知插件改进',
+      deriveMessages: () => [
+        { role: 'user', source: { kind: 'user' }, content: [{ type: 'text', text: '第一次问题' }] },
+        { role: 'user', source: { kind: 'user' }, content: [{ type: 'image', url: 'private-image-url' }, { type: 'text', text: '请加上会话名称和最后提问' }] },
+        { role: 'user', source: { kind: 'plugin' }, content: [{ type: 'text', text: 'private injected context' }] },
+        { role: 'assistant', content: [{ type: 'text', text: 'private assistant output' }] },
+      ],
+    }
+    harness.emit('agent/status', { agent, status: 'running' })
+    agent.session.title = '最新会话名称'
+    harness.emit('agent/status', { agent, status: 'idle' })
+    const text = harness.posts[0].payload.markdown.text
+    assert.match(text, /\*\*会话：\*\* 最新会话名称/)
+    assert.match(text, /\*\*最后提问：\*\* 请加上会话名称和最后提问/)
+    assert.doesNotMatch(text, /第一次问题|private/)
+  } finally { harness.restore() }
+})
+
+test('a live follow-up survives compaction and stays isolated from other sessions', () => {
+  const harness = createHostHarness({ webhookFormat: 'wps-markdown', webhookLanguage: 'zh-CN' })
+  try {
+    const agent = harness.agent('s1')
+    agent.session = { id: 's1', title: '当前会话', deriveMessages: () => [] }
+    harness.emit('agent/status', { agent, status: 'running' })
+    harness.emit('session/event', agent.session, { type: 'user/message', data: { role: 'user', source: { kind: 'user' }, content: [{ type: 'text', text: '本轮补充要求' }] } })
+    harness.emit('session/event', { id: 's2' }, { type: 'user/message', data: { role: 'user', source: { kind: 'user' }, content: [{ type: 'text', text: '其他会话的问题' }] } })
+    harness.emit('session/event', agent.session, { type: 'user/message', data: { role: 'user', source: { kind: 'plugin' }, content: [{ type: 'text', text: '自动检查点' }] } })
+    harness.emit('agent/status', { agent, status: 'idle' })
+    const text = harness.posts[0].payload.markdown.text
+    assert.match(text, /本轮补充要求/)
+    assert.doesNotMatch(text, /其他会话|自动检查点/)
+  } finally { harness.restore() }
+})
+
+test('generic errors and approvals include bounded context with a session ID fallback', () => {
+  const harness = createHostHarness()
+  try {
+    const agent = harness.agent('session-untitled')
+    agent.session = { id: agent.id, deriveMessages: () => [
+      { role: 'user', source: { kind: 'user' }, content: [{ type: 'text', text: '😀'.repeat(220) }] },
+    ] }
+    harness.emit('agent/status', { agent, status: 'running' })
+    harness.emit('agent/error', { agent, error: new Error('boom'), turn: 1, step: 2 })
+    assert.equal(harness.posts[0].payload.sessionTitle, 'session-untitled')
+    assert.equal(harness.posts[0].payload.latestQuestion, '😀'.repeat(200) + '…')
+    const outcome = harness.emit('approval/request', { agent, toolName: 'pwsh' }, () => 'allowed-once')
+    assert.equal(outcome, 'allowed-once')
+    assert.match(harness.posts[1].payload.text, /Session: session-untitled/)
+    assert.match(harness.posts[1].payload.text, /Last question:/)
+  } finally { harness.restore() }
+})
+
+test('an image-only latest input does not reuse an older question', () => {
+  const harness = createHostHarness({ webhookFormat: 'wps-markdown', webhookLanguage: 'zh-CN' })
+  try {
+    const agent = harness.agent('s1')
+    agent.session = { id: 's1', deriveMessages: () => [
+      { role: 'user', source: { kind: 'user' }, content: [{ type: 'text', text: '旧问题' }] },
+      { role: 'user', source: { kind: 'user' }, content: [{ type: 'image', url: 'private-image-url' }] },
+    ] }
+    harness.emit('agent/status', { agent, status: 'running' })
+    harness.emit('agent/status', { agent, status: 'idle' })
+    const text = harness.posts[0].payload.markdown.text
+    assert.match(text, /无文字输入/)
+    assert.doesNotMatch(text, /旧问题|private-image/)
+  } finally { harness.restore() }
+})
+
+test('unavailable session metadata never prevents a notification or approval', () => {
+  const harness = createHostHarness({ webhookFormat: 'wps-markdown' })
+  try {
+    const agent = harness.agent('s1')
+    agent.session = { id: 's1', deriveMessages() { throw new Error('private failure') } }
+    harness.emit('agent/status', { agent, status: 'running' })
+    harness.emit('agent/status', { agent, status: 'idle' })
+    const outcome = harness.emit('approval/request', { agent, toolName: 'pwsh' }, () => 'allowed-once')
+    assert.equal(outcome, 'allowed-once')
+    assert.equal(harness.posts.length, 2)
+    assert.match(harness.posts[0].payload.markdown.text, /s1/)
+    assert.doesNotMatch(JSON.stringify(harness.posts), /private failure/)
   } finally { harness.restore() }
 })
 

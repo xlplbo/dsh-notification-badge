@@ -5,6 +5,7 @@ import { spawn as nodeSpawn } from 'node:child_process'
 import Schema from '@deepseek-ai/schemastery'
 
 export const name = 'dsh-notification-badge'
+export const inject = { optional: ['sessionTitle'] }
 
 /* --- configuration --------------------------------------------------------
  * Every field is `.volatile()`, which makes it a live reference in `apply`
@@ -248,11 +249,16 @@ function formatDuration(ms) {
   return `${Math.floor(s / 60)}m ${s % 60}s`
 }
 
-export function buildWebhookPayload({ summary, body, level, ts = new Date().toISOString() }, format = 'generic', language = 'en') {
-  if (format !== 'wps-markdown') {
-    return { text: body ? `${summary} — ${body}` : summary, summary, body, level, ts }
-  }
+export function buildWebhookPayload({ summary, body, level, sessionTitle, latestQuestion, ts = new Date().toISOString() }, format = 'generic', language = 'en') {
   const zh = language === 'zh-CN'
+  const question = latestQuestion === '' ? (zh ? '（无文字输入）' : '(no text input)') : latestQuestion
+  const context = []
+  if (sessionTitle) context.push([zh ? '会话' : 'Session', sessionTitle])
+  if (question !== undefined) context.push([zh ? '最后提问' : 'Last question', question])
+  if (format !== 'wps-markdown') {
+    const text = [body ? `${summary} — ${body}` : summary, ...context.map(([label, value]) => `${label}: ${value}`)].join('\n')
+    return { text, summary, body, level, ts, ...(sessionTitle ? { sessionTitle } : {}), ...(latestQuestion !== undefined ? { latestQuestion } : {}) }
+  }
   const icon = level === 'error' ? '❌' : level === 'warn' ? '🔔' : '✅'
   const escape = (text) => String(text).replace(/[\\`*_\[\]<>]/g, '\\$&')
   const time = zh
@@ -260,7 +266,12 @@ export function buildWebhookPayload({ summary, body, level, ts = new Date().toIS
     : ts
   return {
     msgtype: 'markdown',
-    markdown: { text: `### ${icon} DSH · ${escape(summary)}\n\n${escape(body)}\n\n**${zh ? '时间' : 'Time'}：** ${time}` },
+    markdown: { text: [
+      `### ${icon} DSH · ${escape(summary)}`,
+      ...context.map(([label, value]) => `**${label}：** ${escape(value)}`),
+      escape(body),
+      `**${zh ? '时间' : 'Time'}：** ${time}`,
+    ].join('\n\n') },
   }
 }
 
@@ -286,7 +297,36 @@ export async function sendWebhook(url, payload, format = 'generic') {
   if (!codes.length && result?.success !== true && result?.result !== 'ok') throw new Error('Unrecognized WPS response')
 }
 
+function summarize(text, limit) {
+  const characters = Array.from(String(text ?? '').replace(/\s+/g, ' ').trim())
+  return characters.slice(0, limit).join('') + (characters.length > limit ? '…' : '')
+}
+
 export function apply(ctx, config) {
+  const latestQuestions = new WeakMap()
+  function rememberQuestion(session, message) {
+    if (message?.role !== 'user' || message.source?.kind !== 'user') return
+    const text = message.content.filter((block) => block.type === 'text').map((block) => block.text).join('\n')
+    latestQuestions.set(session, summarize(text, 200))
+  }
+  function readQuestion(session) {
+    if (!session || latestQuestions.has(session)) return
+    try {
+      const message = session.deriveMessages().findLast((message) => message.role === 'user' && message.source?.kind === 'user')
+      if (message) rememberQuestion(session, message)
+    } catch {}
+  }
+  function webhookContext(agent) {
+    const session = agent?.session
+    if (!session) return {}
+    readQuestion(session)
+    let title
+    try { title = ctx.sessionTitle?.get(session)?.title } catch {}
+    return { sessionTitle: summarize(title || session.id, 100), latestQuestion: latestQuestions.get(session) }
+  }
+  ctx.on('session/event', (session, event) => {
+    if (event.type === 'user/message') rememberQuestion(session, event.data)
+  })
   // Live turn state per agent: when the current turn started and whether its
   // failure was already announced. A WeakMap keeps disposed agents collectable
   // even if `agent/disposed` never arrives.
@@ -304,7 +344,7 @@ export function apply(ctx, config) {
     subagents.delete(session.id)
   })
 
-  function notify(summary, body, level, chinese) {
+  function notify(summary, body, level, chinese, agent) {
     const text = body ? `${summary} — ${body}` : summary
     if (config.desktop.get()) {
       desktopNotify(config.title.get(), text, {
@@ -317,7 +357,7 @@ export function apply(ctx, config) {
       const format = config.webhookFormat.get()
       const language = config.webhookLanguage.get()
       const content = language === 'zh-CN' ? chinese : { summary, body }
-      const payload = buildWebhookPayload({ ...content, level }, format, language)
+      const payload = buildWebhookPayload({ ...content, level, ...webhookContext(agent) }, format, language)
       sendWebhook(webhookUrl, payload, format).catch((error) => {
         // Only sanitized diagnostics reach logs, never the URL or response body.
         ctx.logger(name).warn('webhook POST failed: %s', error.message)
@@ -328,6 +368,7 @@ export function apply(ctx, config) {
   // Turn finished: agent/status flips running -> idle (emit mode).
   ctx.on('agent/status', ({ agent, status }) => {
     if (status === 'running') {
+      readQuestion(agent.session)
       turns.set(agent, { startedAt: Date.now(), errored: false })
       return
     }
@@ -344,7 +385,7 @@ export function apply(ctx, config) {
     const duration = seconds < 60 ? `${seconds} 秒` : `${Math.floor(seconds / 60)} 分 ${seconds % 60} 秒`
     notify('Agent finished', `done in ${formatDuration(elapsed)}`, 'info', {
       summary: '任务完成', body: `耗时：${duration}`,
-    })
+    }, agent)
   })
 
   // A step or turn errored (emit mode).
@@ -359,7 +400,7 @@ export function apply(ctx, config) {
     const detail = String(error?.message ?? error ?? 'unknown error').slice(0, 200)
     notify('Agent error', `turn ${turn}, step ${step}: ${detail}`, 'error', {
       summary: '执行异常', body: `第 ${turn} 轮，第 ${step} 步：${error == null ? '未知错误' : detail}`,
-    })
+    }, agent)
   })
 
   // A tool call awaits approval. approval/request is a WATERFALL: this
@@ -375,7 +416,7 @@ export function apply(ctx, config) {
       const chineseReason = req.displayReason?.['zh-CN'] ?? req.displayReason?.zh ?? req.reason ?? reason
       notify('Approval needed', detail, 'warn', {
         summary: '等待审批', body: chineseReason ? `${req.toolName} — ${chineseReason}` : req.toolName,
-      })
+      }, req.agent)
     }
     return next()
   })

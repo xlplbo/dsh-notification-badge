@@ -168,7 +168,7 @@ setting.
 
 ### Webhook payload
 
-The default `generic` / `en` settings preserve this payload:
+The default `generic` / `en` settings use these fields (shown without session context):
 
 ```json
 {
@@ -194,6 +194,10 @@ Example rendering (the elapsed time and timestamp are illustrative):
 
 > ### ✅ DSH · 任务完成
 >
+> **会话：** 通知插件改进
+>
+> **最后提问：** 这个提醒没有会话名字，如果能加上最后一次提问更好。
+>
 > 耗时：2 分 14 秒
 >
 > **时间：** 2026/11/11 11:30:00（北京时间）
@@ -202,6 +206,22 @@ Error and approval headings become `执行异常` and `等待审批`. Approval r
 Chinese presentation text when supplied; otherwise the original reason is retained. Desktop
 and browser notification wording is unchanged. Webhooks fire regardless of window focus.
 They announce a completed **turn**, not necessarily the completion of a multi-turn goal.
+
+Completion, error and approval webhooks include the current **session title** and the latest
+accepted **human question** when the event supplies a Session. Titles come from DSH's optional
+`sessionTitle` service and fall back to the session ID; they are capped at 100 characters.
+Questions include only text blocks of `role: user` messages with `source.kind: user`, collapse
+whitespace and keep the first 200 Unicode characters plus an ellipsis when truncated. System,
+plugin, assistant and tool messages, and image/attachment contents are not included. An input
+containing no text displays `（无文字输入）` / `(no text input)`, rather than an older question.
+
+The latest accepted question is retained per Session while the plugin runs, including through
+context compaction. On plugin load or session restore, it falls back to the current derived
+history; if that history no longer contains a human question, the question line is omitted.
+Metadata lookup failures do not prevent notifications or approval delegation. In generic JSON,
+`sessionTitle` and `latestQuestion` are optional additional fields and their labels also appear
+in `text`; the original `summary`, `body`, `level` and `ts` fields keep their meanings. This
+feature forwards the user-question excerpt to the already configured webhook destination.
 
 WPS receives `{"msgtype":"markdown","markdown":{"text":"…"}}`. Chinese timestamps use
 Asia/Shanghai; English timestamps use UTC ISO format. Markdown metacharacters in event text
