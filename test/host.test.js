@@ -271,7 +271,9 @@ function createHostHarness(overrides = {}) {
       listeners.set(event, listener)
       return () => listeners.delete(event)
     },
-    sessionTitle: { get: (session) => session.title ? { title: session.title } : undefined },
+    get: (name) => name === 'sessionTitle'
+      ? { get: (session) => session.title ? { title: session.title } : undefined }
+      : undefined,
     logger: () => ({ warn: (...args) => warnings.push(args) }),
   }
   apply(ctx, config)

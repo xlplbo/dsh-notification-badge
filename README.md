@@ -317,6 +317,21 @@ npm install      # @deepseek-ai/schemastery, for the Config schema
 npm test         # syntax check + host and browser-half tests
 ```
 
+The optional runtime integration test also loads the installed Cordis, Session and title service.
+It is skipped unless `DSH_RUNTIME_ROOT` points at a DSH installation root. For a Windows desktop
+installation packaged in ASAR, run it with Electron's Node mode so the archive is readable:
+
+```powershell
+$desktop = Join-Path $env:LOCALAPPDATA 'Programs/DeepSeek Harness'
+$env:ELECTRON_RUN_AS_NODE = '1'
+$env:DSH_RUNTIME_ROOT = "$desktop/resources/app.asar/dsh"
+& "$desktop/DeepSeek Harness.exe" --test
+```
+
+The test intercepts HTTP locally and sends no real notification. It checks activation without
+a title service, then reads a real Session and the title service after it becomes available.
+The plugin uses `ctx.get('sessionTitle')` for this optional lookup; it declares no required service.
+
 To run it inside a harness source checkout, point a patch file at this directory and start the Web UI:
 
 ```yaml

@@ -5,7 +5,6 @@ import { spawn as nodeSpawn } from 'node:child_process'
 import Schema from '@deepseek-ai/schemastery'
 
 export const name = 'dsh-notification-badge'
-export const inject = { optional: ['sessionTitle'] }
 
 /* --- configuration --------------------------------------------------------
  * Every field is `.volatile()`, which makes it a live reference in `apply`
@@ -321,7 +320,7 @@ export function apply(ctx, config) {
     if (!session) return {}
     readQuestion(session)
     let title
-    try { title = ctx.sessionTitle?.get(session)?.title } catch {}
+    try { title = ctx.get('sessionTitle')?.get(session)?.title } catch {}
     return { sessionTitle: summarize(title || session.id, 100), latestQuestion: latestQuestions.get(session) }
   }
   ctx.on('session/event', (session, event) => {
